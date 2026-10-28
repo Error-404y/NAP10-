@@ -1,6 +1,6 @@
 # NAP10 Discord Bot
 
-Discord bot with simple translation and 3-person membership verification.
+Discord bot with simple translation and 2-person membership verification.
 
 ## Translation
 
@@ -15,7 +15,7 @@ The bot replies once with a clean translated embed. It uses the public MyMemory 
 
 ## Verification
 
-A new member receives the Verification Process role. A persistent Start Verification button opens the alliance and in-game username form. Applications appear in the NAP10 review channel and need approval from three distinct NAP10 role holders. The bot assigns NAP10 and removes Verification Process only after three approvals. Failed role assignments can be retried by an existing approver without needing additional votes.
+A new member receives the Verification Process role. A persistent Start Verification button opens the alliance and in-game username form. Applications appear in the NAP10 review channel and need approval from two distinct NAP10 role holders. The bot assigns NAP10 and removes Verification Process only after two approvals. Failed role assignments can be retried by an existing approver without needing additional votes.
 
 ## Setup
 
@@ -42,4 +42,4 @@ The verification vote channel must only be visible to NAP10 reviewers and the bo
 
 ## Database
 
-SQLite is automatically created at `data/nap10.sqlite3` and tracks applications and votes across restarts. Back up this file and use persistent hosting storage. The bot must be online to assign the pending role at join time. Three members need to have the NAP10 role before initial verification voting.
+SQLite is automatically created at `data/nap10.sqlite3` and tracks applications and votes across restarts. Back up this file and use persistent hosting storage. The bot must be online to assign the pending role at join time. Two members need to have the NAP10 role before initial verification voting.
