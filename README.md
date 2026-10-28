@@ -1,53 +1,45 @@
 # NAP10 Discord Bot
 
-Python Discord bot with translation and three-person verification using SQLite.
+Discord bot with simple translation and 3-person membership verification.
 
 ## Translation
 
+Write the target language as the last word:
+
 ```text
-! Hello, guys are you here? Spanish
-! Hola chicos, ¿estáis aquí? English
-! Bonjour tout le monde German
+! Könnt ihr bitte auf Bestätigen drücken? English
+! Hello, guys, are you here? Spanish
 ```
 
-The last word is the target language. The bot replies once with a labeled translation embed. Languages include English, Spanish, German, French, Greek, Russian, Italian, Portuguese, Dutch, Polish, Turkish, Arabic, Japanese, Korean, Chinese and more. Translation uses deep-translator's unofficial Google Translate integration and requires internet access.
+The bot replies once with a clean translated embed. It uses the public MyMemory translation endpoint, not a Google account or API key. Language is detected locally with langdetect. The public endpoint has usage limits, may reject some language pairs and is not guaranteed to be online. Translation requests may be sent to MyMemory, so avoid private information. Messages are limited to 450 characters and an in-memory cache reduces repeat requests.
 
 ## Verification
 
-New members receive the Verification Process role. The verification channel contains a **Start Verification** button, opening a modal asking for alliance and in-game username. The application appears in the review channel. Three **different users with the NAP10 role** must click Approve. The bot then gives the applicant the NAP10 role and removes Verification Process. Applications and approvals persist in SQLite.
+A new member receives the Verification Process role. A persistent Start Verification button opens the alliance and in-game username form. Applications appear in the NAP10 review channel and need approval from three distinct NAP10 role holders. The bot assigns NAP10 and removes Verification Process only after three approvals. Failed role assignments can be retried by an existing approver without needing additional votes.
 
-## Installation
+## Setup
 
-1. Install Python 3.11+ and create a Discord bot in the [Discord Developer Portal](https://discord.com/developers/applications).
-2. Enable **Server Members Intent** and **Message Content Intent** in the bot settings.
-3. Invite the bot with `bot` and `applications.commands` scopes, granting View Channels, Send Messages, Embed Links, Read Message History and Manage Roles.
-4. Place the bot's role **above** the NAP10 and Verification Process roles.
-5. Run:
+1. Use Python 3.11+.
+2. Create a Discord bot and enable Server Members Intent and Message Content Intent in the Discord Developer Portal.
+3. Invite with bot and applications.commands scopes, granting View Channels, Send Messages, Embed Links, Read Message History and Manage Roles.
+4. Make sure the bot role is above the NAP10 and Verification Process roles.
+5. Run `pip install -r requirements.txt`.
+6. Create `.env` (never upload it to GitHub) containing `DISCORD_TOKEN=your_actual_token`.
+7. Set your hosting startup file to `bot.py` or rename `bot.py` to `main.py` on the host. Start with `python bot.py`.
+8. As server administrator, run `/setup_verification` once in Discord.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
+The verification vote channel must only be visible to NAP10 reviewers and the bot. Configure channel permissions to block unverified members from protected areas.
 
-On Windows use `.venv\\Scripts\\activate`. Enter your bot token in the private `.env` file. Never publish it.
+## Discord IDs
 
-6. Start using `python bot.py`.
-7. Run `/setup_verification` **once** as a server administrator. This posts the persistent verification panel.
-
-Restrict the voting channel to NAP10 reviewers and the bot. Configure channel permission overwrites so unverified members cannot access protected areas. The first three reviewers must receive the NAP10 role manually from an administrator.
-
-## Configured server IDs
-
-| Item | ID |
+| Purpose | ID |
 | --- | --- |
-| Server | `1565084541289369690` |
-| Vote channel | `1565096369100816424` |
-| Process role | `1565092660690292767` |
-| NAP10 role | `1565084866725413085` |
-| Verification channel | `1565092827048845443` |
+| Server | 1565084541289369690 |
+| Vote channel | 1565096369100816424 |
+| Verification Process role | 1565092660690292767 |
+| NAP10 role | 1565084866725413085 |
+| Start Verification channel | 1565092827048845443 |
 
-## Storage
+## Database
 
-SQLite is created automatically at `data/nap10.sqlite3`. Keep the `data/` directory on persistent storage when hosting the bot. The bot needs to be online to apply roles when members join and does not automatically repair joins missed while offline.
+SQLite is automatically created at `data/nap10.sqlite3` and tracks applications and votes across restarts. Back up this file and use persistent hosting storage. The bot must be online to assign the pending role at join time. Three members need to have the NAP10 role before initial verification voting.
