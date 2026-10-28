@@ -20,13 +20,12 @@ class VerificationTests(unittest.TestCase):
         button = VoteButton(self.applicant)
         self.assertEqual(button.applicant_id, self.applicant)
 
-    def test_three_unique_votes_and_retry(self):
+    def test_two_unique_votes_and_retry(self):
         self.assertTrue(self.store.submit(self.guild, self.applicant, "Alliance", "Player"))
         self.assertEqual(self.store.vote(self.guild, self.applicant, 1), ("recorded", 1))
         self.assertEqual(self.store.vote(self.guild, self.applicant, 1), ("duplicate", 1))
-        self.assertEqual(self.store.vote(self.guild, self.applicant, 2), ("recorded", 2))
-        self.assertEqual(self.store.vote(self.guild, self.applicant, 3), ("ready", MIN_APPROVALS))
-        self.assertEqual(self.store.vote(self.guild, self.applicant, 3), ("ready", MIN_APPROVALS))
+        self.assertEqual(self.store.vote(self.guild, self.applicant, 2), ("ready", MIN_APPROVALS))
+        self.assertEqual(self.store.vote(self.guild, self.applicant, 2), ("ready", MIN_APPROVALS))
         self.assertEqual(self.store.application(self.guild, self.applicant)["status"], "pending")
         self.store.mark_approved(self.guild, self.applicant)
         self.assertEqual(self.store.application(self.guild, self.applicant)["status"], "approved")
