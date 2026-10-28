@@ -340,7 +340,7 @@ async def on_message(message):
         log.info("Prefix message received | guild=%s channel=%s content_visible=%s", getattr(message.guild, "id", None), message.channel.id, bool(message.content))
     if not message.guild or message.guild.id != GUILD_ID:
         return
-    match = re.fullmatch(r"!\\s*(.+?)\\s+([A-Za-z]+)", message.content.strip(), flags=re.DOTALL)
+    match = re.fullmatch(r"!\s*(.+?)\s+([A-Za-z]+)", message.content.strip(), flags=re.DOTALL)
     if not match:
         if message.content.startswith("!"):
             log.info("No translation match for message %s", message.id)
