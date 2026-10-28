@@ -287,7 +287,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s", bot.user)
+    log.info("Logged in as %s | entry file: %s | guild: %s | message content intent: %s", bot.user, __file__, GUILD_ID, bot.intents.message_content)
 
 
 @bot.event
@@ -334,15 +334,23 @@ async def translate_text(text, target):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or not message.guild or message.guild.id != GUILD_ID:
+    if message.author.bot:
+        return
+    if message.content.lstrip().startswith("!"):
+        log.info("Prefix message received | guild=%s channel=%s content_visible=%s", getattr(message.guild, "id", None), message.channel.id, bool(message.content))
+    if not message.guild or message.guild.id != GUILD_ID:
         return
     match = re.fullmatch(r"!\\s*(.+?)\\s+([A-Za-z]+)", message.content.strip(), flags=re.DOTALL)
     if not match:
+        if message.content.startswith("!"):
+            log.info("No translation match for message %s", message.id)
         return
     source_text, language_name = match.group(1).strip(), match.group(2).lower()
     target = LANGUAGES.get(language_name)
     if not target:
+        log.info("Unsupported language suffix: %s", language_name)
         return
+    log.info("Translation requested for message %s | target=%s", message.id, target)
     if len(source_text) > 450:
         return await message.reply("Maximum 450 characters per translation.", mention_author=False)
     try:
@@ -353,6 +361,23 @@ async def on_message(message):
     except Exception:
         log.exception("Translation failed")
         await message.reply("Translation is temporarily unavailable or the free quota was reached.", mention_author=False)
+
+@bot.tree.command(name="translate", description="Translate text into another language", guild=discord.Object(id=GUILD_ID))
+@discord.app_commands.describe(text="Text to translate", language="Target language, for example English")
+async def slash_translate(interaction: discord.Interaction, text: str, language: str):
+    target = LANGUAGES.get(language.strip().lower())
+    if target is None:
+        return await interaction.response.send_message("Unsupported target language.", ephemeral=True)
+    if len(text) > 450:
+        return await interaction.response.send_message("Maximum 450 characters per translation.", ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    try:
+        translated = await translate_text(text, target)
+        embed = make_embed(f"Translated to {language.strip().title()}", discord.utils.escape_mentions(translated))
+        await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        log.exception("Slash translation failed")
+        await interaction.followup.send("Translation is temporarily unavailable or the free quota was reached.")
 
 
 @bot.tree.command(name="setup_verification", description="Post the NAP10 verification panel", guild=discord.Object(id=GUILD_ID))
