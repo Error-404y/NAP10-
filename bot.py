@@ -21,7 +21,7 @@ NAP10_ROLE_ID = 1565084866725413085
 VERIFY_CHANNEL_ID = 1565092827048845443
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/nap10.sqlite3"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
-MIN_APPROVALS = 3
+MIN_APPROVALS = 2
 COLOR = discord.Color.from_rgb(57, 113, 184)
 LANGUAGES = {
     "english": "en", "spanish": "es", "german": "de", "french": "fr",
@@ -198,7 +198,7 @@ class ApplicationModal(discord.ui.Modal, title="NAP10 Verification"):
             application = store.application(GUILD_ID, member.id)
             message = await channel.send(embed=vote_embed(member, application, 0), view=VoteView(member.id), allowed_mentions=discord.AllowedMentions.none())
             store.set_message(GUILD_ID, member.id, message.id)
-            await interaction.followup.send("Your application has been submitted. Three NAP10 approvals are required.", ephemeral=True)
+            await interaction.followup.send("Your application has been submitted. Two NAP10 approvals are required.", ephemeral=True)
         except discord.HTTPException:
             log.exception("Unable to create verification review")
             store.cancel(GUILD_ID, member.id)
@@ -258,7 +258,7 @@ class VoteButton(discord.ui.Button):
             if not member or not role or not process_role:
                 return await interaction.followup.send("Approval recorded, but roles could not be assigned. Contact an administrator.", ephemeral=True)
             try:
-                await member.add_roles(role, reason="NAP10 verification: three approvals")
+                await member.add_roles(role, reason="NAP10 verification: two approvals")
                 await member.remove_roles(process_role, reason="NAP10 verification complete")
             except discord.HTTPException:
                 store.mark_pending(GUILD_ID, self.applicant_id)
@@ -370,7 +370,7 @@ async def setup_verification(interaction: discord.Interaction):
     channel = interaction.guild.get_channel(VERIFY_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         return await interaction.response.send_message("Verification channel not found.", ephemeral=True)
-    embed = make_embed("NAP10 | Member Verification", "Select **Start Verification** and submit your alliance and in-game username.\n\nAccess is granted after **3 NAP10 approvals**.")
+    embed = make_embed("NAP10 | Member Verification", "Select **Start Verification** and submit your alliance and in-game username.\n\nAccess is granted after **2 NAP10 approvals**.")
     embed.set_footer(text="NAP10 Community | Verification")
     await channel.send(embed=embed, view=StartVerification())
     await interaction.response.send_message("Verification panel posted.", ephemeral=True)
