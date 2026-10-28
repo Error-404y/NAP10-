@@ -6,7 +6,9 @@ import sqlite3
 from pathlib import Path
 
 import discord
-from deep_translator import GoogleTranslator
+import aiohttp
+from langdetect import detect, LangDetectException, DetectorFactory
+DetectorFactory.seed = 0
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -39,6 +41,7 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS applications (
                 guild_id INTEGER NOT NULL,
@@ -117,22 +120,25 @@ class Store:
             ).fetchone()
             if existing:
                 self.conn.execute("COMMIT")
-                return "duplicate", self.count(guild_id, applicant_id)
+                count = self.count(guild_id, applicant_id)
+                return ("ready" if count >= MIN_APPROVALS else "duplicate"), count
             self.conn.execute(
                 "INSERT INTO votes(guild_id,applicant_id,voter_id) VALUES(?,?,?)",
                 (guild_id, applicant_id, voter_id)
             )
             number = self.count(guild_id, applicant_id)
-            if number >= MIN_APPROVALS:
-                self.conn.execute(
-                    "UPDATE applications SET status='approved' WHERE guild_id=? AND user_id=?",
-                    (guild_id, applicant_id)
-                )
             self.conn.execute("COMMIT")
-            return "approved" if number >= MIN_APPROVALS else "recorded", number
+            return "ready" if number >= MIN_APPROVALS else "recorded", number
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+    def mark_approved(self, guild_id, user_id):
+        self.conn.execute("UPDATE applications SET status='approved' WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+
+    def cancel(self, guild_id, user_id):
+        self.conn.execute("DELETE FROM votes WHERE guild_id=? AND applicant_id=?", (guild_id, user_id))
+        self.conn.execute("DELETE FROM applications WHERE guild_id=? AND user_id=? AND status='pending'", (guild_id, user_id))
 
     def mark_pending(self, guild_id, user_id):
         self.conn.execute(
@@ -195,9 +201,11 @@ class ApplicationModal(discord.ui.Modal, title="NAP10 Verification"):
             await interaction.followup.send("Your application has been submitted. Three NAP10 approvals are required.", ephemeral=True)
         except discord.HTTPException:
             log.exception("Unable to create verification review")
-            await interaction.followup.send("Could not post the application. Please contact an administrator.", ephemeral=True)
+            store.cancel(GUILD_ID, member.id)
+            await interaction.followup.send("Could not post the application. Please try again.", ephemeral=True)
         except Exception:
             log.exception("Application submission failed")
+            store.cancel(GUILD_ID, member.id)
             await interaction.followup.send("Verification failed. Please try again later.", ephemeral=True)
 
 
@@ -220,6 +228,7 @@ class VoteView(discord.ui.View):
 class VoteButton(discord.ui.Button):
     def __init__(self, applicant_id):
         super().__init__(label="Approve", style=discord.ButtonStyle.success, custom_id=f"nap10:approve:{applicant_id}")
+        self.applicant_id = applicant_id
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or interaction.guild.id != GUILD_ID:
@@ -243,11 +252,10 @@ class VoteButton(discord.ui.Button):
                 member = await interaction.guild.fetch_member(self.applicant_id)
             except discord.NotFound:
                 member = None
-        if state == "approved":
+        if state == "ready":
             role = interaction.guild.get_role(NAP10_ROLE_ID)
             process_role = interaction.guild.get_role(PROCESS_ROLE_ID)
             if not member or not role or not process_role:
-                store.mark_pending(GUILD_ID, self.applicant_id)
                 return await interaction.followup.send("Approval recorded, but roles could not be assigned. Contact an administrator.", ephemeral=True)
             try:
                 await member.add_roles(role, reason="NAP10 verification: three approvals")
@@ -256,15 +264,17 @@ class VoteButton(discord.ui.Button):
                 store.mark_pending(GUILD_ID, self.applicant_id)
                 log.exception("Unable to assign verification roles")
                 return await interaction.followup.send("Approval recorded, but role assignment failed. Contact an administrator.", ephemeral=True)
+        if state == "ready":
+            store.mark_approved(GUILD_ID, self.applicant_id)
         try:
             await interaction.message.edit(
-                embed=vote_embed(member, application, number, "approved" if state == "approved" else "pending"),
-                view=None if state == "approved" else VoteView(self.applicant_id)
+                embed=vote_embed(member, application, number, "approved" if state == "ready" else "pending"),
+                view=None if state == "ready" else VoteView(self.applicant_id)
             )
         except discord.HTTPException:
             log.exception("Unable to update review embed")
         await interaction.followup.send(
-            "Verification approved. NAP10 role granted." if state == "approved" else f"Approval recorded ({number}/{MIN_APPROVALS}).",
+            "Verification approved. NAP10 role granted." if state == "ready" else f"Approval recorded ({number}/{MIN_APPROVALS}).",
             ephemeral=True
         )
 
@@ -292,36 +302,57 @@ async def on_member_join(member):
             log.exception("Failed to assign process role")
 
 
+TRANSLATION_CACHE = {}
+TRANSLATION_LIMIT = asyncio.Semaphore(2)
+
+async def translate_text(text, target):
+    key = (text, target)
+    if key in TRANSLATION_CACHE:
+        return TRANSLATION_CACHE[key]
+    try:
+        source = detect(text)
+    except LangDetectException as exc:
+        raise ValueError("Unable to identify input language") from exc
+    source = {"zh-cn": "zh-CN", "zh-tw": "zh-TW"}.get(source.lower(), source)
+    if source == target:
+        return text
+    async with TRANSLATION_LIMIT:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18)) as session:
+            async with session.get("https://api.mymemory.translated.net/get", params={"q": text, "langpair": f"{source}|{target}"}) as response:
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
+    if payload.get("responseStatus") != 200:
+        raise RuntimeError(str(payload.get("responseDetails") or "Provider rejected request"))
+    translated = payload.get("responseData", {}).get("translatedText")
+    if not translated:
+        raise RuntimeError("Provider returned no text")
+    if len(TRANSLATION_CACHE) >= 200:
+        TRANSLATION_CACHE.pop(next(iter(TRANSLATION_CACHE)))
+    TRANSLATION_CACHE[key] = translated
+    return translated
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild or message.guild.id != GUILD_ID:
         return
-    content = message.content.strip()
-    if not content.startswith("!"):
-        return
-    raw = content[1:].strip()
-    if not raw:
-        return
-    match = re.fullmatch(r"(.+?)\s+([A-Za-z]+)", raw, flags=re.DOTALL)
+    match = re.fullmatch(r"!\\s*(.+?)\\s+([A-Za-z]+)", message.content.strip(), flags=re.DOTALL)
     if not match:
         return
     source_text, language_name = match.group(1).strip(), match.group(2).lower()
     target = LANGUAGES.get(language_name)
     if not target:
         return
-    if len(source_text) > 1500:
-        return await message.reply("The text is too long (maximum 1,500 characters).", mention_author=False)
+    if len(source_text) > 450:
+        return await message.reply("Maximum 450 characters per translation.", mention_author=False)
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(lambda: GoogleTranslator(source="auto", target=target).translate(source_text)),
-            timeout=20
-        )
-        embed = make_embed(f"Translated to {language_name.title()}", discord.utils.escape_mentions(result or source_text))
+        translated = await translate_text(source_text, target)
+        embed = make_embed(f"Translated to {language_name.title()}", discord.utils.escape_mentions(translated))
         embed.set_footer(text=f"Requested by {message.author.display_name}")
         await message.reply(embed=embed, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         log.exception("Translation failed")
-        await message.reply("Translation is temporarily unavailable.", mention_author=False)
+        await message.reply("Translation is temporarily unavailable or the free quota was reached.", mention_author=False)
 
 
 @bot.tree.command(name="setup_verification", description="Post the NAP10 verification panel", guild=discord.Object(id=GUILD_ID))
