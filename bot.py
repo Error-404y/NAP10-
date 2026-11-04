@@ -196,7 +196,12 @@ class ApplicationModal(discord.ui.Modal, title="NAP10 Verification"):
             if not created:
                 return await interaction.followup.send("You already have an active application.", ephemeral=True)
             application = store.application(GUILD_ID, member.id)
-            message = await channel.send(embed=vote_embed(member, application, 0), view=VoteView(member.id), allowed_mentions=discord.AllowedMentions.none())
+            message = await channel.send(
+                content=f"<@&{NAP10_ROLE_ID}> New verification application awaiting review.",
+                embed=vote_embed(member, application, 0),
+                view=VoteView(member.id),
+                allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=NAP10_ROLE_ID)]),
+            )
             store.set_message(GUILD_ID, member.id, message.id)
             await interaction.followup.send("Your application has been submitted. Two NAP10 approvals are required.", ephemeral=True)
         except discord.HTTPException:
