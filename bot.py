@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ import discord
 import aiohttp
 from langdetect import detect, LangDetectException, DetectorFactory
 DetectorFactory.seed = 0
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,6 +23,7 @@ VERIFY_CHANNEL_ID = 1565092827048845443
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/nap10.sqlite3"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 MIN_APPROVALS = 2
+REMINDER_MINUTES = 30
 COLOR = discord.Color.from_rgb(57, 113, 184)
 LANGUAGES = {
     "english": "en", "spanish": "es", "german": "de", "french": "fr",
@@ -62,7 +64,16 @@ class Store:
                 FOREIGN KEY (guild_id, applicant_id)
                     REFERENCES applications (guild_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS suggestion_settings (
+                guild_id INTEGER PRIMARY KEY,
+                review_channel_id INTEGER NOT NULL
+            );
         """)
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(applications)")}
+        if "reminder_sent" not in columns:
+            self.conn.execute("ALTER TABLE applications ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+        if "rejection_reason" not in columns:
+            self.conn.execute("ALTER TABLE applications ADD COLUMN rejection_reason TEXT")
 
     def application(self, guild_id, user_id):
         return self.conn.execute(
@@ -82,7 +93,7 @@ class Store:
                    VALUES(?,?,?,?,'pending',NULL)
                    ON CONFLICT(guild_id,user_id) DO UPDATE SET
                    alliance=excluded.alliance,username=excluded.username,
-                   status='pending',message_id=NULL,created_at=CURRENT_TIMESTAMP""",
+                   status='pending',message_id=NULL,reminder_sent=0,rejection_reason=NULL,created_at=CURRENT_TIMESTAMP""",
                 (guild_id, user_id, alliance, username)
             )
             self.conn.execute(
@@ -133,6 +144,36 @@ class Store:
             self.conn.execute("ROLLBACK")
             raise
 
+    def due_reminders(self):
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=REMINDER_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+        return self.conn.execute(
+            "SELECT * FROM applications WHERE status='pending' AND message_id IS NOT NULL AND reminder_sent=0 AND created_at<=?",
+            (cutoff,)
+        ).fetchall()
+
+    def mark_reminded(self, guild_id, user_id, message_id):
+        self.conn.execute(
+            "UPDATE applications SET reminder_sent=1 WHERE guild_id=? AND user_id=? AND message_id=? AND status='pending'",
+            (guild_id, user_id, message_id)
+        )
+
+    def reject(self, guild_id, user_id, message_id, reason):
+        cursor = self.conn.execute(
+            "UPDATE applications SET status='rejected', rejection_reason=? WHERE guild_id=? AND user_id=? AND message_id=? AND status='pending'",
+            (reason, guild_id, user_id, message_id)
+        )
+        return cursor.rowcount == 1
+
+    def set_suggestion_channel(self, guild_id, channel_id):
+        self.conn.execute(
+            "INSERT INTO suggestion_settings(guild_id,review_channel_id) VALUES(?,?) ON CONFLICT(guild_id) DO UPDATE SET review_channel_id=excluded.review_channel_id",
+            (guild_id, channel_id)
+        )
+
+    def suggestion_channel(self, guild_id):
+        row = self.conn.execute("SELECT review_channel_id FROM suggestion_settings WHERE guild_id=?", (guild_id,)).fetchone()
+        return row["review_channel_id"] if row else None
+
     def mark_approved(self, guild_id, user_id):
         self.conn.execute("UPDATE applications SET status='approved' WHERE guild_id=? AND user_id=?", (guild_id, user_id))
 
@@ -163,12 +204,17 @@ def make_embed(title, description=None, *, color=COLOR):
 
 
 def vote_embed(member, application, approvals, status="pending"):
-    embed = make_embed("NAP10 | Verification review")
+    colors = {"approved": discord.Color.green(), "rejected": discord.Color.red()}
+    embed = make_embed("NAP10 | Verification Review", color=colors.get(status, COLOR))
     embed.add_field(name="Applicant", value=member.mention if member else f"<@{application['user_id']}>", inline=False)
     embed.add_field(name="Alliance", value=discord.utils.escape_markdown(application["alliance"]), inline=True)
     embed.add_field(name="In-game username", value=discord.utils.escape_markdown(application["username"]), inline=True)
     embed.add_field(name="Approvals", value=f"{approvals} / {MIN_APPROVALS}", inline=False)
-    embed.set_footer(text="Approved" if status == "approved" else "NAP10 members only | One vote per person")
+    embed.add_field(name="Status", value=status.title(), inline=True)
+    if status == "rejected" and application["rejection_reason"]:
+        embed.add_field(name="Reason", value=discord.utils.escape_mentions(application["rejection_reason"]), inline=False)
+    embed.set_footer(text="NAP10 Verification | Two approvals required")
+    embed.timestamp = discord.utils.utcnow()
     return embed
 
 
@@ -223,11 +269,62 @@ class StartVerification(discord.ui.View):
         await interaction.response.send_modal(ApplicationModal())
 
 
+class RejectModal(discord.ui.Modal, title="Reject Verification"):
+    reason = discord.ui.TextInput(label="Rejection reason", style=discord.TextStyle.paragraph, min_length=5, max_length=500, required=True)
+
+    def __init__(self, applicant_id, message_id):
+        super().__init__()
+        self.applicant_id = applicant_id
+        self.message_id = message_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+        application = store.application(GUILD_ID, self.applicant_id)
+        if not application or application["status"] != "pending" or application["message_id"] != self.message_id:
+            return await interaction.response.send_message("This application is no longer pending.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        reason = str(self.reason).strip()
+        if not store.reject(GUILD_ID, self.applicant_id, self.message_id, reason):
+            return await interaction.followup.send("This application has already been processed.", ephemeral=True)
+        updated = store.application(GUILD_ID, self.applicant_id)
+        member = interaction.guild.get_member(self.applicant_id)
+        channel = interaction.guild.get_channel(VOTE_CHANNEL_ID)
+        try:
+            if channel:
+                message = await channel.fetch_message(self.message_id)
+                await message.edit(embed=vote_embed(member, updated, store.count(GUILD_ID, self.applicant_id), "rejected"), view=None)
+        except discord.HTTPException:
+            log.exception("Unable to update rejected verification")
+        try:
+            user = member or await bot.fetch_user(self.applicant_id)
+            await user.send(embed=make_embed("NAP10 | Application Rejected", f"Your verification application was rejected.\n\n**Reason**\n{discord.utils.escape_mentions(reason)}\n\nYou may submit a new application.", color=discord.Color.red()))
+        except (discord.HTTPException, discord.NotFound):
+            await interaction.followup.send("Application rejected. The applicant could not be notified by DM.", ephemeral=True)
+            return
+        await interaction.followup.send("Application rejected and applicant notified.", ephemeral=True)
+
+
+class RejectButton(discord.ui.Button):
+    def __init__(self, applicant_id):
+        super().__init__(label="Reject", style=discord.ButtonStyle.danger, custom_id=f"nap10:reject:{applicant_id}")
+        self.applicant_id = applicant_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Only administrators can reject applications.", ephemeral=True)
+        application = store.application(GUILD_ID, self.applicant_id)
+        if not application or application["status"] != "pending" or application["message_id"] != interaction.message.id:
+            return await interaction.response.send_message("This application is no longer pending.", ephemeral=True)
+        await interaction.response.send_modal(RejectModal(self.applicant_id, interaction.message.id))
+
+
 class VoteView(discord.ui.View):
     def __init__(self, applicant_id: int):
         super().__init__(timeout=None)
         self.applicant_id = applicant_id
         self.add_item(VoteButton(applicant_id))
+        self.add_item(RejectButton(applicant_id))
 
 
 class VoteButton(discord.ui.Button):
@@ -367,6 +464,86 @@ async def on_message(message):
         log.exception("Translation failed")
         await message.reply("Translation is temporarily unavailable or the free quota was reached.", mention_author=False)
 
+
+
+class SuggestionModal(discord.ui.Modal, title="Anonymous Suggestion"):
+    subject = discord.ui.TextInput(label="Subject", min_length=3, max_length=100, required=True)
+    feedback = discord.ui.TextInput(label="Suggestion or feedback", style=discord.TextStyle.paragraph, min_length=10, max_length=1500, required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID:
+            return await interaction.response.send_message("This feature is only available in NAP10.", ephemeral=True)
+        channel_id = store.suggestion_channel(GUILD_ID)
+        channel = interaction.guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("The anonymous feedback channel is not configured. Contact an administrator.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        embed = make_embed("NAP10 | Anonymous Feedback", discord.utils.escape_mentions(str(self.feedback)), color=discord.Color.blurple())
+        embed.add_field(name="Subject", value=discord.utils.escape_mentions(str(self.subject)), inline=False)
+        embed.add_field(name="Status", value="New", inline=True)
+        embed.set_footer(text="Anonymous submission | No author details included")
+        embed.timestamp = discord.utils.utcnow()
+        try:
+            await channel.send(embed=embed, view=SuggestionReviewView(), allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Unable to submit anonymous suggestion")
+            return await interaction.followup.send("Your feedback could not be delivered. Please try again later.", ephemeral=True)
+        await interaction.followup.send(embed=make_embed("Feedback Submitted", "Thank you. Your anonymous feedback has been delivered to the review team. Your identity is not included in the feedback message."), ephemeral=True)
+
+
+class SuggestionPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Submit Anonymous Feedback", style=discord.ButtonStyle.primary, custom_id="nap10:suggestion:submit")
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SuggestionModal())
+
+
+class SuggestionReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Mark Reviewed", style=discord.ButtonStyle.success, custom_id="nap10:suggestion:review")
+    async def review(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+        if not interaction.message.embeds:
+            return await interaction.response.send_message("Feedback embed not found.", ephemeral=True)
+        embed = interaction.message.embeds[0].copy()
+        for index, field in enumerate(embed.fields):
+            if field.name == "Status":
+                embed.set_field_at(index, name="Status", value="Reviewed", inline=True)
+                break
+        embed.color = discord.Color.green()
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+@tasks.loop(minutes=1)
+async def verification_reminders():
+    channel = bot.get_channel(VOTE_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    for application in store.due_reminders():
+        if application["guild_id"] != GUILD_ID:
+            continue
+        try:
+            embed = make_embed("NAP10 | Verification Reminder", f"An application has been waiting at least {REMINDER_MINUTES} minutes for approval.")
+            embed.add_field(name="Applicant", value=f"<@{application['user_id']}>", inline=False)
+            embed.add_field(name="Approvals", value=f"{store.count(GUILD_ID, application['user_id'])} / {MIN_APPROVALS}", inline=True)
+            embed.add_field(name="Review", value=f"[Open application](https://discord.com/channels/{GUILD_ID}/{VOTE_CHANNEL_ID}/{application['message_id']})", inline=False)
+            embed.set_footer(text="NAP10 Verification | Automatic reminder")
+            await channel.send(content=f"<@&{NAP10_ROLE_ID}> Pending verification reminder", embed=embed, allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=NAP10_ROLE_ID)]))
+            store.mark_reminded(GUILD_ID, application["user_id"], application["message_id"])
+        except discord.HTTPException:
+            log.exception("Unable to send verification reminder")
+
+
+@verification_reminders.before_loop
+async def before_verification_reminders():
+    await bot.wait_until_ready()
+
+
 @bot.tree.command(name="setup_verification", description="Post the NAP10 verification panel", guild=discord.Object(id=GUILD_ID))
 @discord.app_commands.default_permissions(administrator=True)
 async def setup_verification(interaction: discord.Interaction):
@@ -381,9 +558,36 @@ async def setup_verification(interaction: discord.Interaction):
     await interaction.response.send_message("Verification panel posted.", ephemeral=True)
 
 
+@bot.tree.command(name="setup_suggestions", description="Post the anonymous feedback panel and configure its review channel", guild=discord.Object(id=GUILD_ID))
+@discord.app_commands.default_permissions(administrator=True)
+async def setup_suggestions(interaction: discord.Interaction, review_channel: discord.TextChannel):
+    if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message("Run this command in the channel where the panel should appear.", ephemeral=True)
+    embed = make_embed("NAP10 | Anonymous Suggestions & Feedback", "Have an idea to improve NAP10? Share suggestions, concerns, or feedback privately.\n\nUse the button below to open the anonymous submission form. Your name and Discord ID will not be included in the submitted feedback.")
+    embed.add_field(name="How it works", value="Submit your subject and feedback. Administrators can review submissions in a private channel.", inline=False)
+    embed.set_footer(text="NAP10 Community | Feedback")
+    try:
+        await interaction.channel.send(embed=embed, view=SuggestionPanel())
+    except discord.HTTPException:
+        return await interaction.response.send_message("Could not post the feedback panel. Check channel permissions.", ephemeral=True)
+    store.set_suggestion_channel(GUILD_ID, review_channel.id)
+    await interaction.response.send_message(f"Feedback panel posted. Anonymous submissions will go to {review_channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="suggest", description="Submit anonymous feedback to NAP10", guild=discord.Object(id=GUILD_ID))
+async def suggest(interaction: discord.Interaction):
+    await interaction.response.send_modal(SuggestionModal())
+
+
 @bot.event
 async def setup_hook():
     bot.add_view(StartVerification())
+    bot.add_view(SuggestionPanel())
+    bot.add_view(SuggestionReviewView())
+    if not verification_reminders.is_running():
+        verification_reminders.start()
     for application in store.pending():
         if application["guild_id"] == GUILD_ID and application["message_id"]:
             bot.add_view(VoteView(application["user_id"]), message_id=application["message_id"])
