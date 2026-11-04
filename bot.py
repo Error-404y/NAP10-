@@ -581,6 +581,21 @@ async def suggest(interaction: discord.Interaction):
     await interaction.response.send_modal(SuggestionModal())
 
 
+@bot.tree.command(name="sync_commands", description="Refresh NAP10 slash commands in this server", guild=discord.Object(id=GUILD_ID))
+@discord.app_commands.default_permissions(administrator=True)
+async def sync_commands(interaction: discord.Interaction):
+    if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        commands_synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        names = ", ".join(f"/{command.name}" for command in commands_synced)
+        await interaction.followup.send(embed=make_embed("NAP10 | Commands Synchronized", f"Registered {len(commands_synced)} server commands.\n\n{names}"), ephemeral=True)
+    except discord.HTTPException:
+        log.exception("Unable to synchronize NAP10 commands")
+        await interaction.followup.send("Command synchronization failed. Check the bot logs and application permissions.", ephemeral=True)
+
+
 @bot.event
 async def setup_hook():
     bot.add_view(StartVerification())
@@ -591,7 +606,8 @@ async def setup_hook():
     for application in store.pending():
         if application["guild_id"] == GUILD_ID and application["message_id"]:
             bot.add_view(VoteView(application["user_id"]), message_id=application["message_id"])
-    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    log.info("Synced %s NAP10 guild commands: %s", len(synced), ", ".join(command.name for command in synced))
 
 
 if __name__ == "__main__":
