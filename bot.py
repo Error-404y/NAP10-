@@ -585,6 +585,15 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 @bot.event
 async def on_ready():
     log.info("Logged in as %s | entry file: %s | guild: %s | message content intent: %s", bot.user, __file__, GUILD_ID, bot.intents.message_content)
+    if not getattr(bot, "verification_panel_refreshed", False):
+        bot.verification_panel_refreshed = True
+        channel = bot.get_channel(VERIFY_CHANNEL_ID)
+        if isinstance(channel, discord.TextChannel):
+            try:
+                updated = await refresh_verification_panel(channel)
+                log.info("Updated %s verification panel(s) to %s approvals", updated, MIN_APPROVALS)
+            except discord.HTTPException:
+                log.exception("Unable to refresh existing verification panels")
 
 
 @bot.event
@@ -861,7 +870,7 @@ def build_poll_embed(poll):
     for index, option in enumerate(options):
         votes = tally.get(index, 0)
         percentage = round(votes / total * 100) if total else 0
-        embed.add_field(name=f"{index + 1}. {option}", value=f"{votes} votes ({percentage}%)", inline=False)
+        embed.add_field(name=f"{index + 1}. {discord.utils.escape_mentions(option)}", value=f"{votes} votes ({percentage}%)", inline=False)
     open_poll = poll["state"] == "open"
     embed.add_field(name="Total Votes", value=str(total), inline=True)
     embed.add_field(name="Status", value="Voting Open" if open_poll else "Voting Closed", inline=True)
@@ -987,6 +996,27 @@ async def before_publishing_scheduler():
     await bot.wait_until_ready()
 
 
+def verification_panel_embed():
+    embed = make_embed(
+        "NAP10 | Member Verification",
+        f"Select **Start Verification** and submit your alliance and in-game username.\n\nAccess is granted after **{MIN_APPROVALS} NAP10 approvals**."
+    )
+    embed.set_footer(text="NAP10 Community | Verification")
+    return embed
+
+
+async def refresh_verification_panel(channel):
+    updated = 0
+    async for message in channel.history(limit=200):
+        if message.author.id != bot.user.id or not message.embeds:
+            continue
+        if message.embeds[0].title != "NAP10 | Member Verification":
+            continue
+        await message.edit(embed=verification_panel_embed(), view=StartVerification())
+        updated += 1
+    return updated
+
+
 @bot.tree.command(name="setup_verification", description="Post the NAP10 verification panel", guild=discord.Object(id=GUILD_ID))
 @discord.app_commands.default_permissions(administrator=True)
 async def setup_verification(interaction: discord.Interaction):
@@ -995,10 +1025,16 @@ async def setup_verification(interaction: discord.Interaction):
     channel = interaction.guild.get_channel(VERIFY_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         return await interaction.response.send_message("Verification channel not found.", ephemeral=True)
-    embed = make_embed("NAP10 | Member Verification", "Select **Start Verification** and submit your alliance and in-game username.\n\nAccess is granted after **2 NAP10 approvals**.")
-    embed.set_footer(text="NAP10 Community | Verification")
-    await channel.send(embed=embed, view=StartVerification())
-    await interaction.response.send_message("Verification panel posted.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        updated = await refresh_verification_panel(channel)
+        if updated:
+            return await interaction.followup.send(f"Updated {updated} existing verification panel(s) to require {MIN_APPROVALS} approvals.", ephemeral=True)
+        await channel.send(embed=verification_panel_embed(), view=StartVerification())
+    except discord.HTTPException:
+        log.exception("Unable to update verification panel")
+        return await interaction.followup.send("Could not update the verification panel. Check channel permissions.", ephemeral=True)
+    await interaction.followup.send("Verification panel posted with 2 approvals.", ephemeral=True)
 
 
 @bot.tree.command(name="setup_suggestions", description="Post the anonymous feedback submission panel", guild=discord.Object(id=GUILD_ID))
