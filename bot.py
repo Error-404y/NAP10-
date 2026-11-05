@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
+import json
 import os
 import re
 import sqlite3
@@ -85,6 +86,35 @@ class Store:
                 choice TEXT NOT NULL CHECK(choice IN ('accept', 'reject')),
                 PRIMARY KEY(message_id, user_id),
                 FOREIGN KEY(message_id) REFERENCES suggestions(message_id)
+            );
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                role_id INTEGER,
+                publish_at INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'scheduled',
+                message_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS polls (
+                message_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                options TEXT NOT NULL,
+                anonymous INTEGER NOT NULL DEFAULT 1,
+                expires_at INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'open',
+                updated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                option_index INTEGER NOT NULL,
+                PRIMARY KEY(message_id,user_id),
+                FOREIGN KEY(message_id) REFERENCES polls(message_id)
             );
         """)
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(applications)")}
@@ -281,6 +311,81 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM applications WHERE status='pending'"
         ).fetchall()
+
+    def create_announcement(self, guild_id, channel_id, title, body, role_id, publish_at):
+        cursor = self.conn.execute(
+            "INSERT INTO announcements(guild_id,channel_id,title,body,role_id,publish_at) VALUES(?,?,?,?,?,?)",
+            (guild_id, channel_id, title, body, role_id, publish_at)
+        )
+        return cursor.lastrowid
+
+    def due_announcements(self):
+        return self.conn.execute(
+            "SELECT * FROM announcements WHERE state='scheduled' AND publish_at<=?",
+            (int(datetime.now(timezone.utc).timestamp()),)
+        ).fetchall()
+
+    def mark_announcement_sent(self, announcement_id, message_id):
+        self.conn.execute("UPDATE announcements SET state='sent',message_id=? WHERE id=? AND state='scheduled'", (message_id, announcement_id))
+
+    def create_poll(self, message_id, guild_id, channel_id, question, options, anonymous, expires_at):
+        self.conn.execute(
+            "INSERT INTO polls(message_id,guild_id,channel_id,question,options,anonymous,expires_at) VALUES(?,?,?,?,?,?,?)",
+            (message_id, guild_id, channel_id, question, json.dumps(options), int(anonymous), expires_at)
+        )
+
+    def poll(self, message_id):
+        return self.conn.execute("SELECT * FROM polls WHERE message_id=?", (message_id,)).fetchone()
+
+    def open_polls(self):
+        return self.conn.execute("SELECT * FROM polls WHERE state='open'").fetchall()
+
+    def polls_to_close(self):
+        return self.conn.execute(
+            "SELECT * FROM polls WHERE (state='open' AND expires_at<=?) OR (state='closed' AND updated=0)",
+            (int(datetime.now(timezone.utc).timestamp()),)
+        ).fetchall()
+
+    def poll_tallies(self, message_id):
+        return {row["option_index"]: row["n"] for row in self.conn.execute(
+            "SELECT option_index,COUNT(*) AS n FROM poll_votes WHERE message_id=? GROUP BY option_index",
+            (message_id,)
+        ).fetchall()}
+
+    def cast_poll_vote(self, message_id, user_id, option_index):
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            poll = self.poll(message_id)
+            if not poll or poll["state"] != "open" or int(datetime.now(timezone.utc).timestamp()) >= poll["expires_at"]:
+                self.conn.execute("COMMIT")
+                return "closed"
+            options = json.loads(poll["options"])
+            if option_index < 0 or option_index >= len(options):
+                self.conn.execute("COMMIT")
+                return "invalid"
+            previous = self.conn.execute(
+                "SELECT option_index FROM poll_votes WHERE message_id=? AND user_id=?",
+                (message_id, user_id)
+            ).fetchone()
+            self.conn.execute(
+                "INSERT INTO poll_votes(message_id,user_id,option_index) VALUES(?,?,?) ON CONFLICT(message_id,user_id) DO UPDATE SET option_index=excluded.option_index",
+                (message_id, user_id, option_index)
+            )
+            self.conn.execute("COMMIT")
+            return "changed" if previous else "recorded"
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def close_poll(self, message_id):
+        self.conn.execute(
+            "UPDATE polls SET state='closed' WHERE message_id=? AND state='open' AND expires_at<=?",
+            (message_id, int(datetime.now(timezone.utc).timestamp()))
+        )
+        return self.poll(message_id)
+
+    def mark_poll_updated(self, message_id):
+        self.conn.execute("UPDATE polls SET updated=1 WHERE message_id=? AND state='closed'", (message_id,))
 
     def close(self):
         self.conn.close()
