@@ -20,6 +20,7 @@ VOTE_CHANNEL_ID = 1565096369100816424
 PROCESS_ROLE_ID = 1565092660690292767
 NAP10_ROLE_ID = 1565084866725413085
 VERIFY_CHANNEL_ID = 1565092827048845443
+SUGGEST_REVIEW_CHANNEL_ID = 1567939785958498484
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/nap10.sqlite3"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 MIN_APPROVALS = 2
@@ -473,10 +474,9 @@ class SuggestionModal(discord.ui.Modal, title="Anonymous Suggestion"):
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild or interaction.guild.id != GUILD_ID:
             return await interaction.response.send_message("This feature is only available in NAP10.", ephemeral=True)
-        channel_id = store.suggestion_channel(GUILD_ID)
-        channel = interaction.guild.get_channel(channel_id) if channel_id else None
+        channel = interaction.guild.get_channel(SUGGEST_REVIEW_CHANNEL_ID)
         if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message("The anonymous feedback channel is not configured. Contact an administrator.", ephemeral=True)
+            return await interaction.response.send_message("The suggest-review channel is unavailable. Contact an administrator.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         embed = make_embed("NAP10 | Anonymous Feedback", discord.utils.escape_mentions(str(self.feedback)), color=discord.Color.blurple())
         embed.add_field(name="Subject", value=discord.utils.escape_mentions(str(self.subject)), inline=False)
@@ -558,9 +558,9 @@ async def setup_verification(interaction: discord.Interaction):
     await interaction.response.send_message("Verification panel posted.", ephemeral=True)
 
 
-@bot.tree.command(name="setup_suggestions", description="Post the anonymous feedback panel and configure its review channel", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="setup_suggestions", description="Post the anonymous feedback submission panel", guild=discord.Object(id=GUILD_ID))
 @discord.app_commands.default_permissions(administrator=True)
-async def setup_suggestions(interaction: discord.Interaction, review_channel: discord.TextChannel):
+async def setup_suggestions(interaction: discord.Interaction):
     if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("Administrator access required.", ephemeral=True)
     if not isinstance(interaction.channel, discord.TextChannel):
@@ -572,8 +572,7 @@ async def setup_suggestions(interaction: discord.Interaction, review_channel: di
         await interaction.channel.send(embed=embed, view=SuggestionPanel())
     except discord.HTTPException:
         return await interaction.response.send_message("Could not post the feedback panel. Check channel permissions.", ephemeral=True)
-    store.set_suggestion_channel(GUILD_ID, review_channel.id)
-    await interaction.response.send_message(f"Feedback panel posted. Anonymous submissions will go to {review_channel.mention}.", ephemeral=True)
+    await interaction.response.send_message(f"Feedback panel posted. Anonymous submissions will go to <#{SUGGEST_REVIEW_CHANNEL_ID}>.", ephemeral=True)
 
 
 @bot.tree.command(name="suggest", description="Submit anonymous feedback to NAP10", guild=discord.Object(id=GUILD_ID))
