@@ -25,6 +25,7 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/nap10.sqlite3"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 MIN_APPROVALS = 2
 REMINDER_MINUTES = 30
+SUGGEST_VOTING_HOURS = 12
 COLOR = discord.Color.from_rgb(57, 113, 184)
 LANGUAGES = {
     "english": "en", "spanish": "es", "german": "de", "french": "fr",
@@ -68,6 +69,22 @@ class Store:
             CREATE TABLE IF NOT EXISTS suggestion_settings (
                 guild_id INTEGER PRIMARY KEY,
                 review_channel_id INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS suggestions (
+                message_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                display_updated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS suggestion_votes (
+                message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                choice TEXT NOT NULL CHECK(choice IN ('accept', 'reject')),
+                PRIMARY KEY(message_id, user_id),
+                FOREIGN KEY(message_id) REFERENCES suggestions(message_id)
             );
         """)
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(applications)")}
@@ -174,6 +191,78 @@ class Store:
     def suggestion_channel(self, guild_id):
         row = self.conn.execute("SELECT review_channel_id FROM suggestion_settings WHERE guild_id=?", (guild_id,)).fetchone()
         return row["review_channel_id"] if row else None
+
+    def add_suggestion(self, message_id, guild_id, channel_id, now):
+        expires_at = now + SUGGEST_VOTING_HOURS * 3600
+        self.conn.execute(
+            "INSERT INTO suggestions(message_id,guild_id,channel_id,created_at,expires_at) VALUES(?,?,?,?,?)",
+            (message_id, guild_id, channel_id, now, expires_at)
+        )
+        return expires_at
+
+    def suggestion(self, message_id):
+        return self.conn.execute("SELECT * FROM suggestions WHERE message_id=?", (message_id,)).fetchone()
+
+    def suggestion_counts(self, message_id):
+        rows = self.conn.execute(
+            "SELECT choice, COUNT(*) AS n FROM suggestion_votes WHERE message_id=? GROUP BY choice",
+            (message_id,)
+        ).fetchall()
+        counts = {row["choice"]: row["n"] for row in rows}
+        return counts.get("accept", 0), counts.get("reject", 0)
+
+    def cast_suggestion_vote(self, message_id, user_id, choice):
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.suggestion(message_id)
+            if not row or row["status"] != "pending" or int(datetime.now(timezone.utc).timestamp()) >= row["expires_at"]:
+                self.conn.execute("COMMIT")
+                return "closed"
+            existing = self.conn.execute(
+                "SELECT choice FROM suggestion_votes WHERE message_id=? AND user_id=?",
+                (message_id, user_id)
+            ).fetchone()
+            if existing:
+                self.conn.execute("COMMIT")
+                return "duplicate"
+            self.conn.execute(
+                "INSERT INTO suggestion_votes(message_id,user_id,choice) VALUES(?,?,?)",
+                (message_id, user_id, choice)
+            )
+            self.conn.execute("COMMIT")
+            return "recorded"
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def pending_suggestions(self):
+        return self.conn.execute("SELECT * FROM suggestions WHERE status='pending'").fetchall()
+
+    def suggestions_to_finish(self):
+        return self.conn.execute(
+            "SELECT * FROM suggestions WHERE (status='pending' AND expires_at<=?) OR (status!='pending' AND display_updated=0)",
+            (int(datetime.now(timezone.utc).timestamp()),)
+        ).fetchall()
+
+    def finish_suggestion(self, message_id):
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.suggestion(message_id)
+            if not row:
+                self.conn.execute("COMMIT")
+                return None
+            if row["status"] == "pending" and int(datetime.now(timezone.utc).timestamp()) >= row["expires_at"]:
+                accept, reject = self.suggestion_counts(message_id)
+                status = "accepted" if accept > reject else "rejected" if reject > accept else "tied" if accept else "no_votes"
+                self.conn.execute("UPDATE suggestions SET status=? WHERE message_id=? AND status='pending'", (status, message_id))
+            self.conn.execute("COMMIT")
+            return self.suggestion(message_id)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def mark_suggestion_display_updated(self, message_id):
+        self.conn.execute("UPDATE suggestions SET display_updated=1 WHERE message_id=? AND status!='pending'", (message_id,))
 
     def mark_approved(self, guild_id, user_id):
         self.conn.execute("UPDATE applications SET status='approved' WHERE guild_id=? AND user_id=?", (guild_id, user_id))
@@ -480,11 +569,16 @@ class SuggestionModal(discord.ui.Modal, title="Anonymous Suggestion"):
         await interaction.response.defer(ephemeral=True)
         embed = make_embed("NAP10 | Anonymous Feedback", discord.utils.escape_mentions(str(self.feedback)), color=discord.Color.blurple())
         embed.add_field(name="Subject", value=discord.utils.escape_mentions(str(self.subject)), inline=False)
-        embed.add_field(name="Status", value="New", inline=True)
-        embed.set_footer(text="Anonymous submission | No author details included")
+        now = int(datetime.now(timezone.utc).timestamp())
+        embed.add_field(name="Status", value="Voting Open", inline=True)
+        embed.add_field(name="Accept", value="0", inline=True)
+        embed.add_field(name="Reject", value="0", inline=True)
+        embed.add_field(name="Voting Ends", value=f"<t:{now + SUGGEST_VOTING_HOURS * 3600}:R>", inline=False)
+        embed.set_footer(text="Anonymous submission | One vote per NAP10 member | 12-hour voting window")
         embed.timestamp = discord.utils.utcnow()
         try:
-            await channel.send(embed=embed, view=SuggestionReviewView(), allowed_mentions=discord.AllowedMentions.none())
+            message = await channel.send(embed=embed, view=SuggestionVoteView(), allowed_mentions=discord.AllowedMentions.none())
+            store.add_suggestion(message.id, GUILD_ID, channel.id, now)
         except discord.HTTPException:
             log.exception("Unable to submit anonymous suggestion")
             return await interaction.followup.send("Your feedback could not be delivered. Please try again later.", ephemeral=True)
@@ -500,23 +594,88 @@ class SuggestionPanel(discord.ui.View):
         await interaction.response.send_modal(SuggestionModal())
 
 
-class SuggestionReviewView(discord.ui.View):
+def suggestion_embed(message, suggestion):
+    embed = message.embeds[0].copy()
+    accept, reject = store.suggestion_counts(suggestion["message_id"])
+    status = suggestion["status"]
+    names = {"pending": "Voting Open", "accepted": "Accepted", "rejected": "Rejected", "tied": "Tied - No Decision", "no_votes": "Closed - No Votes"}
+    for index, field in enumerate(embed.fields):
+        if field.name == "Status":
+            embed.set_field_at(index, name="Status", value=names.get(status, status.title()), inline=True)
+        elif field.name == "Accept":
+            embed.set_field_at(index, name="Accept", value=str(accept), inline=True)
+        elif field.name == "Reject":
+            embed.set_field_at(index, name="Reject", value=str(reject), inline=True)
+    embed.color = discord.Color.green() if status == "accepted" else discord.Color.red() if status == "rejected" else discord.Color.orange() if status != "pending" else discord.Color.blurple()
+    return embed
+
+
+async def refresh_suggestion(message_id, message=None):
+    suggestion = store.suggestion(message_id)
+    if not suggestion:
+        return
+    channel = bot.get_channel(suggestion["channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+    if message is None:
+        message = await channel.fetch_message(message_id)
+    await message.edit(embed=suggestion_embed(message, suggestion), view=SuggestionVoteView() if suggestion["status"] == "pending" else None)
+    if suggestion["status"] != "pending":
+        store.mark_suggestion_display_updated(message_id)
+
+
+class SuggestionVoteButton(discord.ui.Button):
+    def __init__(self, choice):
+        self.choice = choice
+        super().__init__(label="Accept" if choice == "accept" else "Reject", style=discord.ButtonStyle.success if choice == "accept" else discord.ButtonStyle.danger, custom_id=f"nap10:suggestion:vote:{choice}")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.get_role(NAP10_ROLE_ID):
+            return await interaction.response.send_message("Only verified NAP10 members can vote.", ephemeral=True)
+        if not interaction.message:
+            return await interaction.response.send_message("Suggestion message unavailable.", ephemeral=True)
+        suggestion = store.suggestion(interaction.message.id)
+        if not suggestion or suggestion["guild_id"] != GUILD_ID or suggestion["channel_id"] != interaction.channel_id:
+            return await interaction.response.send_message("This suggestion is not registered for voting.", ephemeral=True)
+        result = store.cast_suggestion_vote(interaction.message.id, interaction.user.id, self.choice)
+        if result == "duplicate":
+            return await interaction.response.send_message("You have already voted on this suggestion.", ephemeral=True)
+        if result == "closed":
+            store.finish_suggestion(interaction.message.id)
+            try:
+                await refresh_suggestion(interaction.message.id, interaction.message)
+            except discord.HTTPException:
+                log.exception("Unable to update expired suggestion")
+            return await interaction.response.send_message("Voting for this suggestion has closed.", ephemeral=True)
+        await interaction.response.send_message(f"Your {self.choice} vote has been recorded.", ephemeral=True)
+        try:
+            await refresh_suggestion(interaction.message.id)
+        except discord.HTTPException:
+            log.exception("Unable to refresh suggestion vote counts")
+
+
+class SuggestionVoteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        self.add_item(SuggestionVoteButton("accept"))
+        self.add_item(SuggestionVoteButton("reject"))
 
-    @discord.ui.button(label="Mark Reviewed", style=discord.ButtonStyle.success, custom_id="nap10:suggestion:review")
-    async def review(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("Administrator access required.", ephemeral=True)
-        if not interaction.message.embeds:
-            return await interaction.response.send_message("Feedback embed not found.", ephemeral=True)
-        embed = interaction.message.embeds[0].copy()
-        for index, field in enumerate(embed.fields):
-            if field.name == "Status":
-                embed.set_field_at(index, name="Status", value="Reviewed", inline=True)
-                break
-        embed.color = discord.Color.green()
-        await interaction.response.edit_message(embed=embed, view=None)
+
+@tasks.loop(minutes=1)
+async def suggestion_deadlines():
+    for suggestion in store.suggestions_to_finish():
+        store.finish_suggestion(suggestion["message_id"])
+        try:
+            await refresh_suggestion(suggestion["message_id"])
+        except discord.NotFound:
+            store.mark_suggestion_display_updated(suggestion["message_id"])
+        except discord.HTTPException:
+            log.exception("Unable to close suggestion vote %s", suggestion["message_id"])
+
+
+@suggestion_deadlines.before_loop
+async def before_suggestion_deadlines():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(minutes=1)
@@ -566,13 +725,13 @@ async def setup_suggestions(interaction: discord.Interaction):
     if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message("Run this command in the channel where the panel should appear.", ephemeral=True)
     embed = make_embed("NAP10 | Anonymous Suggestions & Feedback", "Have an idea to improve NAP10? Share suggestions, concerns, or feedback privately.\n\nUse the button below to open the anonymous submission form. Your name and Discord ID will not be included in the submitted feedback.")
-    embed.add_field(name="How it works", value="Submit your subject and feedback. Administrators can review submissions in a private channel.", inline=False)
+    embed.add_field(name="How it works", value="Submit your subject and feedback. Verified NAP10 members have 12 hours to vote Accept or Reject in the review channel.", inline=False)
     embed.set_footer(text="NAP10 Community | Feedback")
     try:
         await interaction.channel.send(embed=embed, view=SuggestionPanel())
     except discord.HTTPException:
         return await interaction.response.send_message("Could not post the feedback panel. Check channel permissions.", ephemeral=True)
-    await interaction.response.send_message(f"Feedback panel posted. Anonymous submissions will go to <#{SUGGEST_REVIEW_CHANNEL_ID}>.", ephemeral=True)
+    await interaction.response.send_message(f"Feedback panel posted. Anonymous submissions will go to <#{SUGGEST_REVIEW_CHANNEL_ID}> for a 12-hour vote.", ephemeral=True)
 
 
 @bot.tree.command(name="suggest", description="Submit anonymous feedback to NAP10", guild=discord.Object(id=GUILD_ID))
@@ -599,7 +758,9 @@ async def sync_commands(interaction: discord.Interaction):
 async def setup_hook():
     bot.add_view(StartVerification())
     bot.add_view(SuggestionPanel())
-    bot.add_view(SuggestionReviewView())
+    bot.add_view(SuggestionVoteView())
+    if not suggestion_deadlines.is_running():
+        suggestion_deadlines.start()
     if not verification_reminders.is_running():
         verification_reminders.start()
     for application in store.pending():
