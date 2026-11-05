@@ -808,6 +808,185 @@ async def before_verification_reminders():
     await bot.wait_until_ready()
 
 
+def announcement_embed(title, body, author=None):
+    embed = make_embed(f"NAP10 | {title}", discord.utils.escape_mentions(body))
+    embed.color = discord.Color.from_rgb(57, 113, 184)
+    embed.timestamp = discord.utils.utcnow()
+    embed.set_footer(text="NAP10 Community | Announcement")
+    return embed
+
+
+class AnnouncementModal(discord.ui.Modal, title="Create Announcement"):
+    headline = discord.ui.TextInput(label="Announcement title", min_length=3, max_length=100, required=True)
+    message = discord.ui.TextInput(label="Announcement message", style=discord.TextStyle.paragraph, min_length=5, max_length=1800, required=True)
+
+    def __init__(self, channel_id, delay_minutes, role_id):
+        super().__init__()
+        self.channel_id = channel_id
+        self.delay_minutes = delay_minutes
+        self.role_id = role_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+        channel = interaction.guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("Announcement channel unavailable.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        title = str(self.headline).strip()
+        body = str(self.message).strip()
+        role = interaction.guild.get_role(self.role_id) if self.role_id else None
+        if self.role_id and role is None:
+            return await interaction.followup.send("Selected role no longer exists.", ephemeral=True)
+        if self.delay_minutes:
+            publish_at = int(datetime.now(timezone.utc).timestamp()) + self.delay_minutes * 60
+            announcement_id = store.create_announcement(GUILD_ID, self.channel_id, title, body, self.role_id, publish_at)
+            embed = make_embed("NAP10 | Announcement Scheduled", f"**Title:** {discord.utils.escape_mentions(title)}\n**Channel:** {channel.mention}\n**Scheduled for:** <t:{publish_at}:F>\n**ID:** {announcement_id}")
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+        content = role.mention if role else None
+        mentions = discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False)
+        try:
+            await channel.send(content=content, embed=announcement_embed(title, body), allowed_mentions=mentions)
+        except discord.HTTPException:
+            log.exception("Unable to publish announcement")
+            return await interaction.followup.send("Could not publish the announcement. Check bot permissions.", ephemeral=True)
+        await interaction.followup.send(embed=make_embed("NAP10 | Announcement Published", f"Your announcement was posted in {channel.mention}."), ephemeral=True)
+
+
+def build_poll_embed(poll):
+    options = json.loads(poll["options"])
+    tally = store.poll_tallies(poll["message_id"])
+    total = sum(tally.values())
+    embed = make_embed("NAP10 | Community Poll", discord.utils.escape_mentions(poll["question"]))
+    for index, option in enumerate(options):
+        votes = tally.get(index, 0)
+        percentage = round(votes / total * 100) if total else 0
+        embed.add_field(name=f"{index + 1}. {option}", value=f"{votes} votes ({percentage}%)", inline=False)
+    open_poll = poll["state"] == "open"
+    embed.add_field(name="Total Votes", value=str(total), inline=True)
+    embed.add_field(name="Status", value="Voting Open" if open_poll else "Voting Closed", inline=True)
+    embed.add_field(name="Deadline", value=f"<t:{poll['expires_at']}:F>", inline=False)
+    embed.set_footer(text="NAP10 Community | Votes can be changed until closing | Results are public")
+    embed.color = COLOR if open_poll else discord.Color.dark_grey()
+    return embed
+
+
+async def refresh_poll(message_id):
+    poll = store.poll(message_id)
+    if poll is None:
+        return
+    channel = bot.get_channel(poll["channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+    message = await channel.fetch_message(message_id)
+    await message.edit(embed=build_poll_embed(poll), view=PollVoteView(len(json.loads(poll["options"]))) if poll["state"] == "open" else None)
+    if poll["state"] == "closed":
+        store.mark_poll_updated(message_id)
+
+
+class PollVoteButton(discord.ui.Button):
+    def __init__(self, index):
+        self.index = index
+        super().__init__(label=f"Option {index + 1}", style=discord.ButtonStyle.primary, custom_id=f"nap10:poll:{index}", row=index // 5)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID or not interaction.message or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("This vote is not available.", ephemeral=True)
+        poll = store.poll(interaction.message.id)
+        if not poll or poll["channel_id"] != interaction.channel_id or poll["guild_id"] != GUILD_ID:
+            return await interaction.response.send_message("This poll is not registered.", ephemeral=True)
+        result = store.cast_poll_vote(poll["message_id"], interaction.user.id, self.index)
+        if result == "closed":
+            store.close_poll(poll["message_id"])
+            try:
+                await refresh_poll(poll["message_id"])
+            except discord.HTTPException:
+                log.exception("Unable to close expired poll")
+            return await interaction.response.send_message("This poll has closed.", ephemeral=True)
+        if result == "invalid":
+            return await interaction.response.send_message("Invalid poll option.", ephemeral=True)
+        await interaction.response.send_message("Your vote has been updated." if result == "changed" else "Your vote has been recorded.", ephemeral=True)
+        try:
+            await refresh_poll(poll["message_id"])
+        except discord.HTTPException:
+            log.exception("Unable to update poll")
+
+
+class PollVoteView(discord.ui.View):
+    def __init__(self, option_count):
+        super().__init__(timeout=None)
+        for index in range(option_count):
+            self.add_item(PollVoteButton(index))
+
+
+class PollModal(discord.ui.Modal, title="Create Community Poll"):
+    question = discord.ui.TextInput(label="Poll question", min_length=5, max_length=200, required=True)
+    choices = discord.ui.TextInput(label="Options, one per line (2 to 10)", style=discord.TextStyle.paragraph, min_length=3, max_length=950, placeholder="Option one\nOption two\nOption three", required=True)
+
+    def __init__(self, channel_id, duration_hours, anonymous):
+        super().__init__()
+        self.channel_id = channel_id
+        self.duration_hours = duration_hours
+        self.anonymous = anonymous
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != GUILD_ID:
+            return await interaction.response.send_message("This poll is only available in NAP10.", ephemeral=True)
+        channel = interaction.guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message("Poll channel is unavailable.", ephemeral=True)
+        options = [line.strip() for line in str(self.choices).splitlines() if line.strip()]
+        if len(options) < 2 or len(options) > 10 or any(len(option) > 80 for option in options) or len(set(option.casefold() for option in options)) != len(options):
+            return await interaction.response.send_message("Enter 2 to 10 different options, each no longer than 80 characters.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        deadline = int(datetime.now(timezone.utc).timestamp()) + self.duration_hours * 3600
+        draft = make_embed("NAP10 | Community Poll", discord.utils.escape_mentions(str(self.question)))
+        for index, option in enumerate(options):
+            draft.add_field(name=f"{index + 1}. {discord.utils.escape_mentions(option)}", value="0 votes (0%)", inline=False)
+        draft.add_field(name="Total Votes", value="0", inline=True)
+        draft.add_field(name="Status", value="Voting Open", inline=True)
+        draft.add_field(name="Deadline", value=f"<t:{deadline}:F>", inline=False)
+        draft.set_footer(text="NAP10 Community | Votes can be changed until closing | Results are public")
+        try:
+            message = await channel.send(embed=draft, view=PollVoteView(len(options)), allowed_mentions=discord.AllowedMentions.none())
+            store.create_poll(message.id, GUILD_ID, channel.id, str(self.question).strip(), options, self.anonymous, deadline)
+        except (discord.HTTPException, sqlite3.Error):
+            log.exception("Unable to create poll")
+            return await interaction.followup.send("Could not create the poll. Check the channel and database permissions.", ephemeral=True)
+        await interaction.followup.send(embed=make_embed("NAP10 | Poll Created", f"Your poll is live in {channel.mention} until <t:{deadline}:F>."), ephemeral=True)
+
+
+@tasks.loop(minutes=1)
+async def publishing_scheduler():
+    for announcement in store.due_announcements():
+        channel = bot.get_channel(announcement["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        role = channel.guild.get_role(announcement["role_id"]) if announcement["role_id"] else None
+        try:
+            message = await channel.send(
+                content=role.mention if role else None,
+                embed=announcement_embed(announcement["title"], announcement["body"]),
+                allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False)
+            )
+            store.mark_announcement_sent(announcement["id"], message.id)
+        except discord.HTTPException:
+            log.exception("Unable to deliver scheduled announcement %s", announcement["id"])
+    for poll in store.polls_to_close():
+        store.close_poll(poll["message_id"])
+        try:
+            await refresh_poll(poll["message_id"])
+        except discord.NotFound:
+            store.mark_poll_updated(poll["message_id"])
+        except discord.HTTPException:
+            log.exception("Unable to finish poll %s", poll["message_id"])
+
+
+@publishing_scheduler.before_loop
+async def before_publishing_scheduler():
+    await bot.wait_until_ready()
+
+
 @bot.tree.command(name="setup_verification", description="Post the NAP10 verification panel", guild=discord.Object(id=GUILD_ID))
 @discord.app_commands.default_permissions(administrator=True)
 async def setup_verification(interaction: discord.Interaction):
@@ -844,6 +1023,24 @@ async def suggest(interaction: discord.Interaction):
     await interaction.response.send_modal(SuggestionModal())
 
 
+@bot.tree.command(name="announce", description="Build and publish or schedule an announcement", guild=discord.Object(id=GUILD_ID))
+@discord.app_commands.default_permissions(administrator=True)
+@discord.app_commands.describe(channel="Channel for the announcement", delay_minutes="Minutes until posting, 0 for immediate", ping_role="Optional role to notify")
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel, delay_minutes: discord.app_commands.Range[int, 0, 10080] = 0, ping_role: discord.Role = None):
+    if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+    await interaction.response.send_modal(AnnouncementModal(channel.id, delay_minutes, ping_role.id if ping_role else None))
+
+
+@bot.tree.command(name="poll", description="Create a timed community poll with 2 to 10 options", guild=discord.Object(id=GUILD_ID))
+@discord.app_commands.default_permissions(administrator=True)
+@discord.app_commands.describe(channel="Channel where the poll will appear", duration_hours="Poll duration in hours (1 to 168)")
+async def poll(interaction: discord.Interaction, channel: discord.TextChannel, duration_hours: discord.app_commands.Range[int, 1, 168] = 24):
+    if not interaction.guild or interaction.guild.id != GUILD_ID or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Administrator access required.", ephemeral=True)
+    await interaction.response.send_modal(PollModal(channel.id, duration_hours, True))
+
+
 @bot.tree.command(name="sync_commands", description="Refresh NAP10 slash commands in this server", guild=discord.Object(id=GUILD_ID))
 @discord.app_commands.default_permissions(administrator=True)
 async def sync_commands(interaction: discord.Interaction):
@@ -864,6 +1061,10 @@ async def setup_hook():
     bot.add_view(StartVerification())
     bot.add_view(SuggestionPanel())
     bot.add_view(SuggestionVoteView())
+    if not publishing_scheduler.is_running():
+        publishing_scheduler.start()
+    for active_poll in store.open_polls():
+        bot.add_view(PollVoteView(len(json.loads(active_poll["options"]))), message_id=active_poll["message_id"])
     if not suggestion_deadlines.is_running():
         suggestion_deadlines.start()
     if not verification_reminders.is_running():
