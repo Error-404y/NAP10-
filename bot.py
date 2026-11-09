@@ -581,7 +581,7 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-incident_broadcast = IncidentBroadcast(bot)
+incident_broadcast = IncidentBroadcast(bot, os.getenv("INCIDENT_DATABASE_PATH", "data/nap10_incidents.sqlite3"))
 
 
 @bot.event
