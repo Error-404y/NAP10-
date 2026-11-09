@@ -13,6 +13,7 @@ from langdetect import detect, LangDetectException, DetectorFactory
 DetectorFactory.seed = 0
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+from incident_broadcast import IncidentBroadcast
 
 load_dotenv()
 
@@ -580,10 +581,12 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+incident_broadcast = IncidentBroadcast(bot, os.getenv("INCIDENT_DATABASE_PATH", "data/nap10_incidents.sqlite3"))
 
 
 @bot.event
 async def on_ready():
+    incident_broadcast.start()
     log.info("Logged in as %s | entry file: %s | guild: %s | message content intent: %s", bot.user, __file__, GUILD_ID, bot.intents.message_content)
     if not getattr(bot, "verification_panel_refreshed", False):
         bot.verification_panel_refreshed = True
@@ -641,6 +644,8 @@ async def translate_text(text, target):
 @bot.event
 async def on_message(message):
     if message.author.bot:
+        return
+    if await incident_broadcast.handle_message(message):
         return
     if message.content.lstrip().startswith("!"):
         log.info("Prefix message received | guild=%s channel=%s content_visible=%s", getattr(message.guild, "id", None), message.channel.id, bool(message.content))
@@ -1119,4 +1124,5 @@ if __name__ == "__main__":
     try:
         bot.run(TOKEN)
     finally:
+        incident_broadcast.close()
         store.close()
