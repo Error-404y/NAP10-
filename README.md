@@ -44,14 +44,16 @@ The verification vote channel must only be visible to NAP10 reviewers and the bo
 
 SQLite is automatically created at `data/nap10.sqlite3` and tracks applications and votes across restarts. Back up this file and use persistent hosting storage. The bot must be online to assign the pending role at join time. Two members need to have the NAP10 role before initial verification voting.
 
-## Controlled cross-server incident simulation
+## Operator-issued cross-server service advisories
 
-The operator keywords are accepted **only** in Discord server `1569493510715871232`, channel `1569493511286300775`. Commands must be sent by a server administrator. Set `INCIDENT_OPERATOR_USER_IDS` to a comma-separated list of operator Discord IDs for additional access restriction.
+The operator keywords are accepted **only** in Discord server `1569493510715871232`, channel `1569493511286300775`, by an administrator. An optional `INCIDENT_OPERATOR_USER_IDS` allowlist provides further control.
 
-- `DataErrorRev.x`: publish a professional **simulated database connectivity incident** notice in **every text channel the bot can post to, across all servers where this bot is installed**.
-- `FixDataError.x`: publish a short restoration notice in the same channels. After **60 seconds**, automatically remove **both** the original incident notices and restoration messages from those channels.
+- `DataErrorRev.x`: issue an **operations advisory** about potential disruption to database-dependent workflows in every accessible text channel across all servers where the bot is installed.
+- `FixDataError.x`: issue a short **advisory-cleared** notice to those channels and remove both notices automatically after 60 seconds.
 
-Notices are embeds without role or user mentions. Bot state and all message IDs are stored in `data/nap10_incidents.sqlite3` (override via `INCIDENT_DATABASE_PATH`), so cleanup continues after a bot restart. Repeated activation is blocked while an incident is active or its cleanup is pending. Channels without View Channel, Send Messages, Embed Links, or Read Message History access are skipped so all published notices remain eligible for automatic deletion. Notices use terse SRE-style terms such as **persistence-tier degradation**, **connection-pool saturation**, and **transaction commit latency**, with a discreet **MODE: CONTROLLED EXERCISE** field. The former footer is omitted entirely. The commands model an incident and do not verify that an actual database outage occurred.
+These are **manually issued communications**. The keywords do not test database health or confirm that an outage occurred. Member-facing embeds use technical language, show `STATE` and `SOURCE: OPERATIONS`, and contain no exercise label or footer.
+
+Notices do not mention users or roles. Message IDs and cleanup status are persisted in the bot-specific SQLite incident database, so cleanup resumes after restarts. Repeat activation is blocked during an open advisory. Channels lacking View Channel, Send Messages, Embed Links, or Read Message History are skipped.
 
 The bot requires **Message Content Intent** in its code and **enabled under Discord Developer Portal → Bot → Privileged Gateway Intents** to detect text keywords. Both bot deployments must have access to the control server and channel. Keep `INCIDENT_DATABASE_PATH` on persistent storage and use only one running instance per bot to avoid conflicting broadcasts.
 
